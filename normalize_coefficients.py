@@ -7,7 +7,7 @@ experimental 3.8 "Cd_min = 0" model). See the notebook for the derivation
 of the normalization models and validation plots.
 
 Requirements:
-    pip install scipy pandas numpy splinecloud-scipy
+    pip install scipy pandas numpy
 """
 
 import re
@@ -19,8 +19,6 @@ import numpy as np
 import pandas as pd
 from scipy.interpolate import UnivariateSpline
 from scipy.optimize import brentq, curve_fit, minimize_scalar
-
-from splinecloud_scipy import load_spline
 
 # Root directory VLM sweep results are read from (see wing_vlm_analysis.OUTPUT_DIR
 # / run_vlm_analysis.WingAnalysisManager.export, which write into this layout).
@@ -138,24 +136,19 @@ def load_wing_coeff_tables(airfoil_name, aspect_ratio, taper_ratio, sweep_c4_deg
     return WingCoeffTables(cl_table, cd_table, clg_table, alpha_values, alphas, etas)
 
 
-def load_alpha_zero_lift(spline_id, bracket=(-5, 5)):
+def _is_symmetric_airfoil(airfoil_name):
     """
-    Find the zero-lift angle of attack [deg] of an airfoil's inviscid
-    cl(alpha) polar, loaded from SplineCloud by `spline_id`.
-
-    Parameters
-    ----------
-    spline_id : str
-        SplineCloud curve ID or URL for the airfoil's cl(alpha) polar.
-    bracket : tuple of float
-        Bracket [deg] to search for the zero crossing in.
-
-    Returns
-    -------
-    alpha_zero_lift : float
+    NACA 4-digit airfoils with "00" camber/position digits (e.g.
+    "naca0009") are symmetric; everything else (e.g. "naca2412") is
+    treated as cambered.
     """
-    cl_curve = load_spline(spline_id)
-    return brentq(lambda a: cl_curve.eval(a), *bracket, xtol=1e-8)
+    match = re.match(r"naca(\d{2})\d{2}$", airfoil_name.strip().lower())
+    if not match:
+        raise ValueError(
+            f"Cannot determine airfoil type from name {airfoil_name!r}; "
+            f"expected a NACA 4-digit name, e.g. 'naca2412' or 'naca0009'."
+        )
+    return match.group(1) == "00"
 
 
 def _alpha_column(tables, alpha_deg):
@@ -170,15 +163,26 @@ def _alpha_column(tables, alpha_deg):
 # 2. Normalizing coefficients
 # -----------------------------------------------------------------------
 
-def _normalize_cl_symmetric_all_alphas(cl_table, alpha_values, alpha_zero_lift, k_alpha):
+def _normalize_cla_all_alphas(cl_table, alpha_values, alpha_zero_lift, k_alpha):
+    """
+    Trial-normalize cla(eta, alpha) across all swept alphas for a given
+    k_alpha; used by `find_optimal_k_alpha`'s objective only (final
+    output uses `normalize_symmetric`/`normalize_cambered` instead).
+
+    `alpha_zero_lift` may be a scalar (symmetric airfoil, uniform across
+    eta) or a per-eta array (cambered airfoil's alpha_zero_lift_circ(eta)).
+    Columns landing on (or very near) the shifted zero-lift angle are
+    masked out to avoid dividing by ~0.
+    """
+    alpha_zero_lift = np.broadcast_to(alpha_zero_lift, len(cl_table)).astype(float)
     norm_table = pd.DataFrame(index=cl_table.index)
     for col, alpha_deg in alpha_values.items():
-        if alpha_deg == int(alpha_zero_lift):
-            continue
         cl_vals = cl_table[col].to_numpy(dtype=float)
-        sin_alpha = np.sin(np.radians(alpha_deg))
+        sin_alpha = np.sin(np.radians(alpha_deg - alpha_zero_lift))
         cos_alpha = np.cos(np.radians(alpha_deg))
-        norm_table[col] = (cl_vals / (2 * pi * sin_alpha)) * np.sqrt(2 / (1 + k_alpha * cos_alpha))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            values = (cl_vals / (2 * pi * sin_alpha)) * np.sqrt(2 / (1 + k_alpha * cos_alpha))
+        norm_table[col] = np.where(np.abs(sin_alpha) > 1e-6, values, np.nan)
 
     return norm_table
 
@@ -187,17 +191,19 @@ def find_optimal_k_alpha(cl_table, alpha_values, alpha_zero_lift, k_bounds=(0.0,
     """
     Fit the k_alpha constant of the finite-wing cl_a normalization model
     by minimizing the median-relative spread of the normalized
-    cl_a(eta)* curves across all swept angles of attack.
+    cl_a(eta)* curves across all swept angles of attack, fit directly
+    against `cl_table` alone (no separate reference airfoil needed).
 
     Parameters
     ----------
     cl_table : pd.DataFrame
-        A symmetric airfoil's cl(eta, alpha) sweep table (`WingCoeffTables.cl_table`).
+        The airfoil's own cl(eta, alpha) sweep table (`WingCoeffTables.cl_table`).
     alpha_values : dict
         As returned in `WingCoeffTables.alpha_values` for `cl_table`.
-    alpha_zero_lift : float
-        Zero-lift angle of attack [deg] of the (symmetric) airfoil's
-        inviscid polar, from `load_alpha_zero_lift`.
+    alpha_zero_lift : float or np.ndarray
+        Zero-lift angle of attack [deg]: a single scalar for a symmetric
+        airfoil (0 by construction), or the per-eta alpha_zero_lift_circ(eta)
+        array (from `fit_alpha_zero_lift`) for a cambered airfoil.
     k_bounds : tuple of float
         Search bounds for k_alpha.
 
@@ -206,10 +212,10 @@ def find_optimal_k_alpha(cl_table, alpha_values, alpha_zero_lift, k_bounds=(0.0,
     k_alpha : float
     """
     def objective(k_alpha):
-        norm_table = _normalize_cl_symmetric_all_alphas(cl_table, alpha_values, alpha_zero_lift, k_alpha)
-        row_median = norm_table.median(axis=1)
+        norm_table = _normalize_cla_all_alphas(cl_table, alpha_values, alpha_zero_lift, k_alpha)
+        row_median = norm_table.median(axis=1, skipna=True)
         rel_dev = norm_table.sub(row_median, axis=0).abs().div(row_median.abs(), axis=0)
-        return rel_dev.values.mean()
+        return np.nanmean(rel_dev.values)
 
     result = minimize_scalar(objective, bounds=k_bounds, method="bounded", options={"xatol": 1e-6})
     return round(result.x, 2)
@@ -457,15 +463,20 @@ def normalize_cambered(tables, k_alpha, alpha_deg=DEFAULT_ALPHA_DEG,
     )
 
 
-def normalize_symmetric_wing_coefficients(
-    airfoil_name, spline_id, aspect_ratio, taper_ratio, sweep_c4_deg,
+def normalize_wing_coefficients(
+    airfoil_name, aspect_ratio, taper_ratio, sweep_c4_deg,
     alpha_deg=DEFAULT_ALPHA_DEG, vlm_dir=VLM_DIR,
     low_drop_ind=DEFAULT_LOW_DROP_IND, high_drop_ind=DEFAULT_HIGH_DROP_IND,
+    r2_threshold=DEFAULT_R2_THRESHOLD,
 ):
     """
-    Load a symmetric airfoil's VLM sweep and normalize cla*, clg*,
-    cdi*(eta) at `alpha_deg`, deriving k_alpha from its own cl(eta, alpha)
-    sweep. See `load_wing_coeff_tables` and `normalize_symmetric`.
+    Load `airfoil_name`'s own VLM sweep and normalize cla*, clg*,
+    cdi*(eta) at `alpha_deg`. The normalization model — and whether
+    alpha_zero_lift(eta)/alpha_min_drag(eta)/cd_min(eta) are fit at all,
+    or assumed zero by symmetry — is chosen by parsing `airfoil_name`
+    (see `_is_symmetric_airfoil`). Every fit, including k_alpha, uses
+    only this airfoil's own sweep; no separate reference airfoil is
+    needed for either case.
 
     Returns
     -------
@@ -479,50 +490,19 @@ def normalize_symmetric_wing_coefficients(
     tables = load_wing_coeff_tables(
         airfoil_name, aspect_ratio, taper_ratio, sweep_c4_deg, vlm_dir, low_drop_ind, high_drop_ind
     )
-    alpha_zero_lift = load_alpha_zero_lift(spline_id)
-    k_alpha = find_optimal_k_alpha(tables.cl_table, tables.alpha_values, alpha_zero_lift)
 
-    norm_df = normalize_symmetric(tables, alpha_zero_lift, k_alpha, alpha_deg)
-    return norm_df, k_alpha
+    if _is_symmetric_airfoil(airfoil_name):
+        alpha_zero_lift = 0.0
+        k_alpha = find_optimal_k_alpha(tables.cl_table, tables.alpha_values, alpha_zero_lift)
+        norm_df = normalize_symmetric(tables, alpha_zero_lift, k_alpha, alpha_deg)
+    else:
+        alpha_zero_lift_circ = fit_alpha_zero_lift(tables.clg_table, tables.alphas, r2_threshold)
+        k_alpha = find_optimal_k_alpha(tables.cl_table, tables.alpha_values, alpha_zero_lift_circ)
+        alpha_min_drag, cd_min = fit_alpha_min_drag(tables.cd_table, tables.alphas, r2_threshold)
+        norm_df = normalize_cambered(
+            tables, k_alpha, alpha_deg, alpha_zero_lift_circ, alpha_min_drag, cd_min, r2_threshold
+        )
 
-
-def normalize_cambered_wing_coefficients(
-    airfoil_name, spline_id, sym_airfoil_name, sym_spline_id,
-    aspect_ratio, taper_ratio, sweep_c4_deg,
-    alpha_deg=DEFAULT_ALPHA_DEG, vlm_dir=VLM_DIR,
-    low_drop_ind=DEFAULT_LOW_DROP_IND, high_drop_ind=DEFAULT_HIGH_DROP_IND,
-    r2_threshold=DEFAULT_R2_THRESHOLD,
-):
-    """
-    Load a cambered airfoil's VLM sweep and its symmetric reference
-    airfoil's VLM sweep (same AR/TR/sweep), then normalize cla*, clg*,
-    cdi*(eta) at `alpha_deg`. k_alpha is fit against the symmetric
-    reference; alpha_zero_lift_circ(eta) and alpha_min_drag(eta)/cd_min(eta)
-    are fit against the cambered airfoil's own data.
-
-    `spline_id` / `sym_spline_id` are SplineCloud curve IDs for each
-    airfoil's inviscid cl(alpha) polar, used to find its zero-lift angle.
-
-    Returns
-    -------
-    norm_df : pd.DataFrame
-        Indexed by eta, with columns "cla*", "clg*", "cdi*",
-        "alpha_zero_lift", "alpha_min_drag", "cd_min".
-    k_alpha : float
-        Store separately with `export_k_alpha` (it's a per-wing scalar,
-        not a per-eta value).
-    """
-    cam_tables = load_wing_coeff_tables(
-        airfoil_name, aspect_ratio, taper_ratio, sweep_c4_deg, vlm_dir, low_drop_ind, high_drop_ind
-    )
-    sym_tables = load_wing_coeff_tables(
-        sym_airfoil_name, aspect_ratio, taper_ratio, sweep_c4_deg, vlm_dir, low_drop_ind, high_drop_ind
-    )
-
-    alpha_zero_lift_sym = load_alpha_zero_lift(sym_spline_id)
-    k_alpha = find_optimal_k_alpha(sym_tables.cl_table, sym_tables.alpha_values, alpha_zero_lift_sym)
-
-    norm_df = normalize_cambered(cam_tables, k_alpha, alpha_deg, r2_threshold=r2_threshold)
     return norm_df, k_alpha
 
 
@@ -619,33 +599,14 @@ def export_k_alpha(k_alpha, airfoil_name, aspect_ratio, taper_ratio, output_dir=
 
 if __name__ == "__main__":
 
-    AIRFOIL = "naca2412"
-    AIRFOIL_SPLINE_ID = "spl_ZzvJssXVaX5e"
-    SYM_AIRFOIL = "naca0009"
-    SYM_AIRFOIL_SPLINE_ID = "spl_Q6b8osbpxaLi"
-
-    AR, TR, SW = 8, 1.0, 0
+    AIRFOILS = ["naca2412", "naca0009"]  # each processed independently, from its own VLM sweep
+    AR, TR, SW = 8, 0.2, 0
     ALPHA_DEG = 6
 
-    EXPORT_SYM_AIRFOIL = True  # also normalize/export the symmetric reference airfoil itself
+    for airfoil in AIRFOILS:
+        norm_df, k_alpha = normalize_wing_coefficients(airfoil, AR, TR, SW, alpha_deg=ALPHA_DEG)
+        out_path = export_normalized_coefficients(norm_df, airfoil, AR, TR, SW, ALPHA_DEG)
+        k_alpha_path = export_k_alpha(k_alpha, airfoil, AR, TR)
 
-    norm_df, k_alpha = normalize_cambered_wing_coefficients(
-        AIRFOIL, AIRFOIL_SPLINE_ID, SYM_AIRFOIL, SYM_AIRFOIL_SPLINE_ID,
-        AR, TR, SW, alpha_deg=ALPHA_DEG,
-    )
-    out_path = export_normalized_coefficients(norm_df, AIRFOIL, AR, TR, SW, ALPHA_DEG)
-    k_alpha_path = export_k_alpha(k_alpha, AIRFOIL, AR, TR)
-
-    print(f"Normalized coefficients exported to {out_path}")
-    print(f"k_alpha exported to {k_alpha_path}")
-
-    if EXPORT_SYM_AIRFOIL:
-        sym_norm_df, sym_k_alpha = normalize_symmetric_wing_coefficients(
-            SYM_AIRFOIL, SYM_AIRFOIL_SPLINE_ID, AR, TR, SW, alpha_deg=ALPHA_DEG,
-        )
-        sym_out_path = export_normalized_coefficients(sym_norm_df, SYM_AIRFOIL, AR, TR, SW, ALPHA_DEG)
-        sym_k_alpha_path = export_k_alpha(sym_k_alpha, SYM_AIRFOIL, AR, TR)
-
-        print(f"Symmetric airfoil normalized coefficients exported to {sym_out_path}")
-        print(f"Symmetric airfoil k_alpha exported to {sym_k_alpha_path}")
-    print(f"k_alpha exported to {k_alpha_path}")
+        print(f"[{airfoil}] normalized coefficients exported to {out_path}")
+        print(f"[{airfoil}] k_alpha exported to {k_alpha_path}")
