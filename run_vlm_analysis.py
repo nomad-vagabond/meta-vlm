@@ -147,6 +147,12 @@ class WingAnalysisManager:
         "..._cd(eta, alpha).csv", "..._gamma(eta, alpha).csv" and
         "..._clg(eta, alpha).csv".
 
+        Files are grouped under `output_dir` by [airfoil name] -> [aspect
+        ratio] -> [taper ratio], matching ``WingAnalysis`` exports, e.g.
+        "naca2412/AR=8/TR=0.6/...cl(eta, alpha).csv". Whichever of aspect
+        ratio / taper ratio is the swept variable has no single fixed
+        value, so its folder level is omitted.
+
         Parameters
         ----------
         output_dir : str or Path
@@ -162,7 +168,11 @@ class WingAnalysisManager:
         if not self.analyses:
             raise RuntimeError("Call `sweep()` before exporting.")
 
-        output_dir = Path(output_dir)
+        output_dir = Path(output_dir) / self.airfoil_name
+        if self.sweep_variable != "aspect_ratio":
+            output_dir /= f"AR={self.baseline['aspect_ratio']:g}"
+        if self.sweep_variable != "taper_ratio":
+            output_dir /= f"TR={self.baseline['taper_ratio']:g}"
         output_dir.mkdir(parents=True, exist_ok=True)
 
         fixed_parts = []
@@ -216,7 +226,7 @@ class WingAnalysisManager:
 if __name__ == "__main__":
 
     mgr = WingAnalysisManager("naca2412",
-        aspect_ratio=8.0, taper_ratio=0.6, sweep_c4_deg=0.0, alpha_deg=3.0,
+        aspect_ratio=8.0, taper_ratio=0.4, sweep_c4_deg=0.0, alpha_deg=3.0,
         velocity=50.0, rho=1.225, n_span=80, n_chord=24,
     )
 

@@ -16,7 +16,7 @@ from matplotlib.patches import FancyArrowPatch
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 # Root directory for exported analysis results, inside the project's `output/` folder
-OUTPUT_DIR = Path(__file__).resolve().parent / "output" / "wing_aerocoeff_distribution"
+OUTPUT_DIR = Path(__file__).resolve().parent / "output" / "vlm"
 
 N_SPAN = 30
 N_CHORD = 8
@@ -323,8 +323,9 @@ class WingAnalysis:
         """
         Export a spanwise distribution dict to a CSV file. Requires `run()` first.
 
-        The filename encodes the airfoil and wing parameters, angle of
-        attack, and `name`, e.g. "naca2412_AR8_taper0.6_sweep10_alpha5_cl.csv".
+        Files are grouped under `output_dir` by [airfoil name] -> [aspect
+        ratio] -> [taper ratio], e.g.
+        "naca2412/AR=8/TR=0.6/naca2412_AR8_taper0.6_sweep10_alpha5_cl.csv".
 
         Parameters
         ----------
@@ -350,7 +351,12 @@ class WingAnalysis:
         if dist is None:
             raise RuntimeError("Call `run()` before exporting results.")
 
-        output_dir = Path(output_dir)
+        output_dir = (
+            Path(output_dir)
+            / self.airfoil_name
+            / f"AR={self.aspect_ratio:g}"
+            / f"TR={self.taper_ratio:g}"
+        )
         output_dir.mkdir(parents=True, exist_ok=True)
 
         filename = (
